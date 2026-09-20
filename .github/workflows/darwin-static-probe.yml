@@ -1,0 +1,228 @@
+name: Darwin static probe
+
+# Temporary workflow, paired with `scripts/darwin-static-probe.nix`.
+#
+# Builds the static darwin package set from two Nixpkgs revisions, each with and
+# without the stale Template Haskell declarations, to show which of the two the
+# failure in https://github.com/NixOS/nixfmt/issues/411 actually turns on.
+# Nothing in that closure is in cache.nixos.org, so this job builds GHC from
+# source; both revisions share that build.
+#
+# Delete this file, and the scripts it calls, once the question is settled.
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - ci/darwin-static-probe
+
+permissions:
+  contents: read
+
+env:
+  # The probe takes a Nixpkgs; these choose which one.
+  BASELINE: (import ./scripts/nixpkgs-sources.nix).baseline
+  PATCHED: (import ./scripts/nixpkgs-sources.nix).patched
+
+jobs:
+  probe:
+    name: aarch64-darwin
+    runs-on: macos-latest
+    # Building GHC from source is slow, and GitHub's hard limit is 360 minutes.
+    timeout-minutes: 350
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+
+      - name: Report the runner's disk space
+        run: df -h /
+
+      - name: Report the static toolchain
+        run: |
+          set -euo pipefail
+          nix-instantiate --eval --strict --json \
+            --arg nixpkgs "$BASELINE" \
+            -A toolchainReport scripts/darwin-static-probe.nix > toolchain.json
+          jq . toolchain.json
+          {
+            echo '## Toolchain'
+            echo ''
+            echo '```json'
+            jq . toolchain.json
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Report how each revision names the compiler
+        run: |
+          set -euo pipefail
+          {
+            for revision in "$BASELINE" "$PATCHED"; do
+              drv="$(nix-instantiate --arg nixpkgs "$revision" \
+                -A pretty-simple scripts/darwin-static-probe.nix)"
+              echo "$revision"
+              grep -o -- '--with-ghc[^ "]*' "$drv" | sort -u | sed 's/^/  /'
+            done
+          } | tee with-ghc.txt
+          {
+            echo '## How each revision names the compiler'
+            echo ''
+            echo 'A bare name is resolved through PATH, where the depsBuildBuild'
+            echo 'compiler shadows the one the package set means to use.'
+            echo ''
+            echo '```'
+            cat with-ghc.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Build the static GHC
+        id: ghc
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          nix-build --arg nixpkgs "$BASELINE" \
+            -A ghc -o result-ghc scripts/darwin-static-probe.nix
+
+      - name: Report whether that GHC is dynamic
+        if: always()
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          if [ ! -e result-ghc ]; then
+            echo 'The static GHC did not build, so there is nothing to report.'
+            exit 0
+          fi
+          ghc_bin="$(find -L result-ghc/bin -maxdepth 1 -name '*ghc' -print -quit)"
+          "$ghc_bin" --info | grep '"GHC Dynamic"' > ghc-dynamic.txt
+          cat ghc-dynamic.txt
+          {
+            echo '## GHC Dynamic'
+            echo ''
+            echo 'This is the compiler the static package set means to use.'
+            echo ''
+            echo '```'
+            cat ghc-dynamic.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 'Without the fix: pretty-simple'
+        id: baseline-pretty-simple
+        if: always()
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          nix-build --arg nixpkgs "$BASELINE" \
+            -A pretty-simple -o result-baseline-pretty-simple scripts/darwin-static-probe.nix
+
+      - name: 'Without the fix: nixfmt-static'
+        id: baseline-nixfmt-static
+        if: always()
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          nix-build --arg nixpkgs "$BASELINE" \
+            -A nixfmt-static -o result-baseline-nixfmt-static scripts/darwin-static-probe.nix
+          ./result-baseline-nixfmt-static/bin/nixfmt --version
+
+      - name: 'Without the fix: declarations removed'
+        id: baseline-declarations-removed
+        if: always()
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          nix-build --arg nixpkgs "$BASELINE" \
+            -A declarations-removed -o result-baseline-declarations-removed \
+            scripts/darwin-static-probe.nix
+          ./result-baseline-declarations-removed/bin/nixfmt --version
+
+      - name: 'With the fix: pretty-simple'
+        id: patched-pretty-simple
+        if: always()
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          nix-build --arg nixpkgs "$PATCHED" \
+            -A pretty-simple -o result-patched-pretty-simple scripts/darwin-static-probe.nix
+
+      - name: 'With the fix: nixfmt-static'
+        id: patched-nixfmt-static
+        if: always()
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          nix-build --arg nixpkgs "$PATCHED" \
+            -A nixfmt-static -o result-patched-nixfmt-static scripts/darwin-static-probe.nix
+          ./result-patched-nixfmt-static/bin/nixfmt --version
+
+      - name: 'With the fix: declarations removed'
+        id: patched-declarations-removed
+        if: always()
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          nix-build --arg nixpkgs "$PATCHED" \
+            -A declarations-removed -o result-patched-declarations-removed \
+            scripts/darwin-static-probe.nix
+          ./result-patched-declarations-removed/bin/nixfmt --version
+
+      - name: Summarise
+        if: always()
+        env:
+          BASELINE_PRETTY_SIMPLE: ${{ steps.baseline-pretty-simple.outcome }}
+          BASELINE_NIXFMT_STATIC: ${{ steps.baseline-nixfmt-static.outcome }}
+          BASELINE_DECLARATIONS_REMOVED: ${{ steps.baseline-declarations-removed.outcome }}
+          PATCHED_PRETTY_SIMPLE: ${{ steps.patched-pretty-simple.outcome }}
+          PATCHED_NIXFMT_STATIC: ${{ steps.patched-nixfmt-static.outcome }}
+          PATCHED_DECLARATIONS_REMOVED: ${{ steps.patched-declarations-removed.outcome }}
+        run: |
+          set -euo pipefail
+          {
+            echo '## Results'
+            echo ''
+            echo '| Build | Without the fix | With the fix |'
+            echo '| --- | --- | --- |'
+            echo "| pretty-simple | $BASELINE_PRETTY_SIMPLE | $PATCHED_PRETTY_SIMPLE |"
+            echo "| nixfmt-static | $BASELINE_NIXFMT_STATIC | $PATCHED_NIXFMT_STATIC |"
+            echo "| nixfmt-static, declarations removed | $BASELINE_DECLARATIONS_REMOVED | $PATCHED_DECLARATIONS_REMOVED |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # These steps deliberately do not continue on error: a step's outcome is
+      # invisible through the public API, but its conclusion is not.
+      - name: 'Assert: without the fix, pretty-simple fails'
+        if: always()
+        env:
+          OUTCOME: ${{ steps.baseline-pretty-simple.outcome }}
+        run: '[ "$OUTCOME" = failure ]'
+
+      - name: 'Assert: without the fix, nixfmt-static fails'
+        if: always()
+        env:
+          OUTCOME: ${{ steps.baseline-nixfmt-static.outcome }}
+        run: '[ "$OUTCOME" = failure ]'
+
+      - name: 'Assert: without the fix, removing the declarations builds'
+        if: always()
+        env:
+          OUTCOME: ${{ steps.baseline-declarations-removed.outcome }}
+        run: '[ "$OUTCOME" = success ]'
+
+      - name: 'Assert: with the fix, pretty-simple builds'
+        if: always()
+        env:
+          OUTCOME: ${{ steps.patched-pretty-simple.outcome }}
+        run: '[ "$OUTCOME" = success ]'
+
+      - name: 'Assert: with the fix, nixfmt-static builds'
+        if: always()
+        env:
+          OUTCOME: ${{ steps.patched-nixfmt-static.outcome }}
+        run: '[ "$OUTCOME" = success ]'
+
+      - name: 'Assert: with the fix, removing the declarations still builds'
+        if: always()
+        env:
+          OUTCOME: ${{ steps.patched-declarations-removed.outcome }}
+        run: '[ "$OUTCOME" = success ]'
